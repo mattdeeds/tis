@@ -1,0 +1,17 @@
+[server]
+bind = "0.0.0.0:8080"
+cache_dir = "/home/pi/.cache/tis"
+state_file = "/home/pi/.local/share/tis/state.json"
+thumb_size = 300
+
+# Uncomment for HTTPS:
+# tls_cert = "/path/to/cert.pem"
+# tls_key = "/path/to/key.pem"
+
+[[directories]]
+name = "Photos"
+path = "/home/pi/photos"
+
+[[directories]]
+name = "Camera"
+path = "/home/pi/camera"
