@@ -3,9 +3,10 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 
 mod thumb;
 mod web;
@@ -44,8 +45,11 @@ pub struct DownloadState {
 
 pub struct AppState {
     pub config: Config,
+    /// Pre-canonicalized directory paths (None if dir doesn't exist)
+    pub canonical_dirs: Vec<Option<PathBuf>>,
     pub downloads: RwLock<DownloadState>,
     pub thumb_semaphore: Semaphore,
+    pub save_notify: Notify,
 }
 
 impl AppState {
@@ -81,7 +85,7 @@ fn load_tls_config(
     Ok(config)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
 
@@ -90,17 +94,29 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let config: Config = toml::from_str(&config_str).unwrap_or_else(|e| {
+    let config: Config = basic_toml::from_str(&config_str).unwrap_or_else(|e| {
         eprintln!("failed to parse config: {}", e);
         std::process::exit(1);
     });
 
-    // Validate directories exist
-    for dir in &config.directories {
-        if !dir.path.is_dir() {
-            eprintln!("warning: directory '{}' does not exist: {}", dir.name, dir.path.display());
-        }
-    }
+    // Pre-canonicalize directory paths
+    let canonical_dirs: Vec<Option<PathBuf>> = config
+        .directories
+        .iter()
+        .map(|dir| {
+            match dir.path.canonicalize() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    eprintln!(
+                        "warning: directory '{}' not accessible: {}",
+                        dir.name,
+                        dir.path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
 
     // Load download state
     let downloads = if config.server.state_file.exists() {
@@ -123,8 +139,23 @@ async fn main() {
 
     let state = Arc::new(AppState {
         config,
+        canonical_dirs,
         downloads: RwLock::new(downloads),
         thumb_semaphore: Semaphore::new(1),
+        save_notify: Notify::new(),
+    });
+
+    // Spawn debounced state saver
+    let saver = state.clone();
+    tokio::spawn(async move {
+        loop {
+            saver.save_notify.notified().await;
+            // Debounce: wait for rapid successive marks
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Err(e) = saver.save_state().await {
+                eprintln!("failed to save state: {}", e);
+            }
+        }
     });
 
     let app = web::router(state.clone());
@@ -140,10 +171,12 @@ async fn main() {
         });
 
         let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-        let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap_or_else(|e| {
-            eprintln!("failed to bind to {}: {}", bind_addr, e);
-            std::process::exit(1);
-        });
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("failed to bind to {}: {}", bind_addr, e);
+                std::process::exit(1);
+            });
 
         eprintln!("listening on https://{}", bind_addr);
 
@@ -165,13 +198,16 @@ async fn main() {
                 };
 
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let mut app = app.clone();
-                    async move {
-                        use tower::Service;
-                        app.call(req.map(axum::body::Body::new)).await
-                    }
-                });
+                let service =
+                    hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let mut app = app.clone();
+                            async move {
+                                use tower_service::Service;
+                                app.call(req.map(axum::body::Body::new)).await
+                            }
+                        },
+                    );
 
                 hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -180,10 +216,12 @@ async fn main() {
             });
         }
     } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap_or_else(|e| {
-            eprintln!("failed to bind to {}: {}", bind_addr, e);
-            std::process::exit(1);
-        });
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("failed to bind to {}: {}", bind_addr, e);
+                std::process::exit(1);
+            });
 
         eprintln!("listening on http://{}", bind_addr);
         axum::serve(listener, app).await.unwrap();
