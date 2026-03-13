@@ -9,22 +9,28 @@ pub async fn get_or_create(
     size: u32,
     semaphore: &tokio::sync::Semaphore,
 ) -> Result<Vec<u8>, String> {
+    // Include file size and mtime in cache path to avoid collisions when
+    // different SD cards have images with identical filenames (e.g. DSC_0001.JPG).
+    let src_meta = std::fs::metadata(source).map_err(|e| e.to_string())?;
+    let src_len = src_meta.len();
+    let src_mtime = src_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let cache_path = cache_dir
         .join("thumbs")
         .join(dir_idx.to_string())
+        .join(format!("{src_len}_{src_mtime}"))
         .join(relative_path);
 
-    // Check if cached thumbnail is still valid
-    if let Ok(cache_meta) = std::fs::metadata(&cache_path) {
-        if let Ok(src_meta) = std::fs::metadata(source) {
-            if let (Ok(ct), Ok(st)) = (cache_meta.modified(), src_meta.modified()) {
-                if ct > st {
-                    return tokio::fs::read(&cache_path)
-                        .await
-                        .map_err(|e| e.to_string());
-                }
-            }
-        }
+    // Check if cached thumbnail exists (cache key already encodes source identity)
+    if cache_path.exists() {
+        return tokio::fs::read(&cache_path)
+            .await
+            .map_err(|e| e.to_string());
     }
 
     // Generate thumbnail (limit concurrency to control memory)
